@@ -1,0 +1,560 @@
+#include <WiFi.h>
+
+// ---------- WiFi AP config ----------
+const char* ssid     = "EnergyMonitor-Group20";
+const char* password = "12345678";
+
+WiFiServer server(80);
+
+// ---------- UART config (STM32 <-> ESP32) ----------
+#define STM_RX_PIN 16   // ESP32 RX2 (reads STM32 TX)
+#define STM_TX_PIN 17   // ESP32 TX2 (to STM32 RX)
+
+// ---------- Data structures ----------
+struct Reading {
+  float Vlamp;
+  float Ilamp;
+  float Plamp;
+  float Vfan;
+  float Ifan;
+  float Pfan;
+  unsigned long timestamp; // ms since ESP32 boot
+};
+
+Reading latest;
+bool latestValid = false;
+
+// 24-hour history, one sample per minute => 1440 points
+const int HISTORY_SIZE = 1440;
+Reading historyBuf[HISTORY_SIZE];
+int historyCount = 0;
+int historyIndex = 0;
+unsigned long lastHistorySave = 0;  // used to save once/minute
+
+// ---------- HTML UI (embedded) ----------
+const char PAGE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Smart Home Energy Monitor</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    background: #0b1120;
+    color: #e5e7eb;
+    margin: 0;
+    padding: 0;
+  }
+  header {
+    padding: 1rem 1.5rem;
+    background: #111827;
+    border-bottom: 1px solid #1f2937;
+  }
+  h1 {
+    margin: 0;
+    font-size: 1.5rem;
+  }
+  .sub {
+    font-size: 0.85rem;
+    color: #9ca3af;
+  }
+  .container {
+    padding: 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+  .card {
+    background: #111827;
+    border-radius: 0.75rem;
+    padding: 1rem;
+    flex: 1 1 260px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+  }
+  .card h2 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.1rem;
+  }
+  .value-row {
+    display: flex;
+    justify-content: space-between;
+    margin: 0.25rem 0;
+    font-size: 0.95rem;
+  }
+  .label {
+    color: #9ca3af;
+  }
+  .val {
+    font-weight: bold;
+  }
+  .badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    margin-left: 0.25rem;
+  }
+  .badge-on {
+    background: #22c55e33;
+    color: #22c55e;
+  }
+  .badge-off {
+    background: #ef444433;
+    color: #f97316;
+  }
+  .btn-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+  button {
+    border: none;
+    border-radius: 999px;
+    padding: 0.4rem 0.9rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    background: #1d4ed8;
+    color: white;
+  }
+  button.off {
+    background: #dc2626;
+  }
+  button:active {
+    transform: scale(0.97);
+  }
+  #alertBar {
+    margin-top: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    border-radius: 0.5rem;
+    font-size: 0.8rem;
+    display: none;
+  }
+  #alertBar.high {
+    display: block;
+    background: #ef444433;
+    color: #fecaca;
+  }
+  #chartCard {
+    flex: 1 1 100%;
+  }
+  #chart {
+    width: 100%;
+    height: 200px;
+    background: #020617;
+    border-radius: 0.5rem;
+  }
+  canvas {
+    width: 100%;
+    height: 200px;
+  }
+  .footer {
+    padding: 0.5rem 1.5rem 1rem;
+    font-size: 0.75rem;
+    color: #6b7280;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Smart Home Energy Monitor</h1>
+  <div class="sub">ESP32 Wi-Fi Dashboard · STM32 RTOS Core</div>
+</header>
+
+<div class="container">
+
+  <div class="card">
+    <h2>Overview</h2>
+    <div class="value-row">
+      <span class="label">Total Power:</span>
+      <span class="val" id="totalPower">-- W</span>
+    </div>
+    <div class="value-row">
+      <span class="label">Last Update:</span>
+      <span class="val" id="lastUpdate">--</span>
+    </div>
+    <div id="alertBar"></div>
+  </div>
+
+  <div class="card">
+    <h2>Lamp <span id="lampStateBadge" class="badge badge-off">OFF</span></h2>
+    <div class="value-row">
+      <span class="label">Voltage</span>
+      <span class="val" id="lampV">-- V</span>
+    </div>
+    <div class="value-row">
+      <span class="label">Current</span>
+      <span class="val" id="lampI">-- mA</span>
+    </div>
+    <div class="value-row">
+      <span class="label">Power</span>
+      <span class="val" id="lampP">-- mW</span>
+    </div>
+    <div class="btn-row">
+      <button onclick="sendCmd('lamp/on')">Lamp ON</button>
+      <button class="off" onclick="sendCmd('lamp/off')">Lamp OFF</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Fan <span id="fanStateBadge" class="badge badge-off">OFF</span></h2>
+    <div class="value-row">
+      <span class="label">Voltage</span>
+      <span class="val" id="fanV">-- V</span>
+    </div>
+    <div class="value-row">
+      <span class="label">Current</span>
+      <span class="val" id="fanI">-- mA</span>
+    </div>
+    <div class="value-row">
+      <span class="label">Power</span>
+      <span class="val" id="fanP">-- mW</span>
+    </div>
+    <div class="btn-row">
+      <button onclick="sendCmd('fan/on')">Fan ON</button>
+      <button class="off" onclick="sendCmd('fan/off')">Fan OFF</button>
+    </div>
+  </div>
+
+  <div class="card" id="chartCard">
+    <h2>24-Hour Power Trend (Total)</h2>
+    <div id="chart">
+      <canvas id="historyCanvas"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  Uses STM32 + ESP32 + dual INA219 · RTOS tasks: sensing, logging, control, UI.
+</div>
+
+<script>
+let lampOn = false;
+let fanOn = false;
+let history = [];  // array of {t, totalP_W}
+
+function sendCmd(path) {
+  fetch('/' + path)
+    .then(_ => console.log('Sent command: ' + path))
+    .catch(err => console.error(err));
+
+  // UI-only state (actual relay is on STM32)
+  if (path === 'lamp/on') lampOn = true;
+  if (path === 'lamp/off') lampOn = false;
+  if (path === 'fan/on')  fanOn = true;
+  if (path === 'fan/off') fanOn = false;
+  updateBadges();
+}
+
+function updateBadges() {
+  const lampBadge = document.getElementById('lampStateBadge');
+  const fanBadge  = document.getElementById('fanStateBadge');
+  lampBadge.textContent = lampOn ? 'ON' : 'OFF';
+  lampBadge.className = 'badge ' + (lampOn ? 'badge-on' : 'badge-off');
+  fanBadge.textContent = fanOn ? 'ON' : 'OFF';
+  fanBadge.className = 'badge ' + (fanOn ? 'badge-on' : 'badge-off');
+}
+
+function fetchLatest() {
+  fetch('/data/latest')
+    .then(r => r.json())
+    .then(d => {
+      if (!d || !d.valid) return;
+
+      document.getElementById('lampV').textContent = d.Vlamp.toFixed(2) + ' V';
+      document.getElementById('lampI').textContent = d.Ilamp.toFixed(2) + ' mA';
+      document.getElementById('lampP').textContent = d.Plamp.toFixed(0) + ' mW';
+
+      document.getElementById('fanV').textContent = d.Vfan.toFixed(2) + ' V';
+      document.getElementById('fanI').textContent = d.Ifan.toFixed(2) + ' mA';
+      document.getElementById('fanP').textContent = d.Pfan.toFixed(0) + ' mW';
+
+      const totalP_W = (d.Plamp + d.Pfan) / 1000.0;
+      document.getElementById('totalPower').textContent = totalP_W.toFixed(2) + ' W';
+
+      const timeStr = new Date(d.timestamp_ms).toLocaleTimeString();
+      document.getElementById('lastUpdate').textContent = timeStr;
+
+      const alertBar = document.getElementById('alertBar');
+      const thresholdW = 20.0;
+      if (totalP_W > thresholdW) {
+        alertBar.textContent = 'High usage alert: ' + totalP_W.toFixed(2) + ' W > ' + thresholdW + ' W';
+        alertBar.className = 'high';
+      } else {
+        alertBar.textContent = '';
+        alertBar.className = '';
+      }
+    })
+    .catch(err => console.error(err));
+}
+
+function fetchHistory() {
+  fetch('/data/history')
+    .then(r => r.json())
+    .then(arr => {
+      if (!Array.isArray(arr)) return;
+      history = arr;
+      drawHistory();
+    })
+    .catch(err => console.error(err));
+}
+
+function drawHistory() {
+  const canvas = document.getElementById('historyCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width  = canvas.clientWidth;
+  const h = canvas.height = canvas.clientHeight;
+
+  ctx.clearRect(0, 0, w, h);
+
+  if (!history.length) {
+    ctx.fillStyle = '#6b7280';
+    ctx.fillText('No history yet...', 10, 20);
+    return;
+  }
+
+  let maxP = 0;
+  history.forEach(p => {
+    if (p.totalP_W > maxP) maxP = p.totalP_W;
+  });
+  if (maxP < 1) maxP = 1;
+
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+
+  history.forEach((p, i) => {
+    const x = (i / (history.length - 1)) * (w - 10) + 5;
+    const y = h - (p.totalP_W / maxP) * (h - 20) - 10;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+
+  ctx.stroke();
+
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '10px monospace';
+  ctx.fillText('0 W', 5, h - 5);
+  ctx.fillText(maxP.toFixed(1) + ' W', 5, 10);
+}
+
+setInterval(fetchLatest, 1000);
+setInterval(fetchHistory, 30000);
+
+updateBadges();
+fetchLatest();
+fetchHistory();
+</script>
+</body>
+</html>
+)HTML";
+
+// ---------- Helpers ----------
+void saveToHistory(const Reading& r) {
+  unsigned long now = millis();
+  if (now - lastHistorySave < 60000UL && historyCount > 0) return; // 1 min
+  lastHistorySave = now;
+  historyBuf[historyIndex] = r;
+  historyBuf[historyIndex].timestamp = now;
+  historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+  if (historyCount < HISTORY_SIZE) historyCount++;
+}
+
+String latestToJson() {
+  String s = "{";
+  if (!latestValid) {
+    s += "\"valid\":false}";
+    return s;
+  }
+  s += "\"valid\":true";
+  s += ",\"Vlamp\":" + String(latest.Vlamp, 3);
+  s += ",\"Ilamp\":" + String(latest.Ilamp, 3);
+  s += ",\"Plamp\":" + String(latest.Plamp, 3);
+  s += ",\"Vfan\":"  + String(latest.Vfan, 3);
+  s += ",\"Ifan\":"  + String(latest.Ifan, 3);
+  s += ",\"Pfan\":"  + String(latest.Pfan, 3);
+  s += ",\"timestamp_ms\":" + String(latest.timestamp);
+  s += "}";
+  return s;
+}
+
+String historyToJson() {
+  String out = "[";
+  for (int i = 0; i < historyCount; ++i) {
+    int idx = (historyIndex + HISTORY_SIZE - historyCount + i) % HISTORY_SIZE;
+    float totalP_W = (historyBuf[idx].Plamp + historyBuf[idx].Pfan) / 1000.0;
+    out += "{\"t\":" + String(historyBuf[idx].timestamp);
+    out += ",\"totalP_W\":" + String(totalP_W, 3);
+    out += "}";
+    if (i != historyCount - 1) out += ",";
+  }
+  out += "]";
+  return out;
+}
+
+// Parse STM32 line: DATA,Vlamp,Ilamp,Plamp,Vfan,Ifan,Pfan
+bool parseDataLine(const String& line, Reading& r) {
+  if (!line.startsWith("DATA,")) return false;
+  int idx = 5; // after "DATA,"
+  float vals[6];
+
+  for (int i = 0; i < 6; ++i) {
+    int comma = line.indexOf(',', idx);
+    String token;
+    if (comma == -1 && i < 5) return false;
+    if (comma == -1) token = line.substring(idx);
+    else             token = line.substring(idx, comma);
+    vals[i] = token.toFloat();
+    idx = comma + 1;
+  }
+
+  r.Vlamp = vals[0];
+  r.Ilamp = vals[1];
+  r.Plamp = vals[2];
+  r.Vfan  = vals[3];
+  r.Ifan  = vals[4];
+  r.Pfan  = vals[5];
+  r.timestamp = millis();
+  return true;
+}
+
+// Send single-character commands to STM32: '1' = ON, '2' = OFF
+void sendCommandToSTM(char cmd) {
+  Serial2.write(cmd);
+  Serial2.write('\n');  // optional newline
+  Serial.print("ESP32 -> STM32: ");
+  Serial.println(cmd);
+}
+
+// ---------- HTTP ----------
+void handleHttpClient(WiFiClient& client) {
+  String req = client.readStringUntil('\r');
+  client.readStringUntil('\n');
+  Serial.print("HTTP request: ");
+  Serial.println(req);
+
+  String path = "/";
+  int firstSpace = req.indexOf(' ');
+  int secondSpace = req.indexOf(' ', firstSpace + 1);
+  if (firstSpace != -1 && secondSpace != -1) {
+    path = req.substring(firstSpace + 1, secondSpace);
+  }
+
+  while (client.available()) {
+    String h = client.readStringUntil('\n');
+    if (h == "\r" || h.length() == 1) break;
+  }
+
+  if (path == "/") {
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/html");
+    client.println("Connection: close");
+    client.println();
+    client.print(PAGE_HTML);
+  }
+  else if (path == "/data/latest") {
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.print(latestToJson());
+  }
+  else if (path == "/data/history") {
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.print(historyToJson());
+  }
+  // Lamp buttons -> STM32 relay (single actuator)
+  else if (path == "/lamp/on") {
+    sendCommandToSTM('1');
+    client.println("HTTP/1.1 200 OK");
+    client.println("Connection: close");
+    client.println();
+  }
+  else if (path == "/lamp/off") {
+    sendCommandToSTM('2');
+    client.println("HTTP/1.1 200 OK");
+    client.println("Connection: close");
+    client.println();
+  }
+  // Fan buttons: same relay for now (or change to '3','4' if you later add a second output)
+  else if (path == "/fan/on") {
+    sendCommandToSTM('1');   // same relay
+    client.println("HTTP/1.1 200 OK");
+    client.println("Connection: close");
+    client.println();
+  }
+  else if (path == "/fan/off") {
+    sendCommandToSTM('2');   // same relay
+    client.println("HTTP/1.1 200 OK");
+    client.println("Connection: close");
+    client.println();
+  }
+  else {
+    client.println("HTTP/1.1 404 Not Found");
+    client.println("Connection: close");
+    client.println();
+    client.println("Not found");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("Starting ESP32 WiFi Access Point...");
+
+  Serial2.begin(115200, SERIAL_8N1, STM_RX_PIN, STM_TX_PIN);
+
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+void loop() {
+  // 1) Handle HTTP
+  WiFiClient client = server.available();
+  if (client) {
+    while (!client.available()) {
+      delay(1);
+    }
+    handleHttpClient(client);
+    delay(1);
+    client.stop();
+  }
+
+  // 2) Handle UART from STM32
+  if (Serial2.available()) {
+    String line = Serial2.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) return;
+
+    Serial.print("STM32 -> ESP32: ");
+    Serial.println(line);
+
+    if (!line.startsWith("DATA,")) {
+      Serial.println("Ignored non-DATA line");
+      return;
+    }
+
+    Reading r;
+    if (parseDataLine(line, r)) {
+      latest = r;
+      latestValid = true;
+      saveToHistory(latest);
+      Serial.println("Parsed DATA line OK");
+    } else {
+      Serial.println("ERROR: parseDataLine failed");
+    }
+  }
+}
